@@ -34,6 +34,13 @@ from checkov.common.models.enums import ErrorStatus, ParallelizationType
 from checkov.common.output.csv import CSVSBOM
 from checkov.common.output.cyclonedx import CycloneDX
 from checkov.common.output.gitlab_sast import GitLabSast
+from checkov.common.output.observability import (
+    CancellationToken,
+    ProgressTracker,
+    ScanCancelledError,
+    ScanError,
+    sanitize_text,
+)
 from checkov.common.output.report import Report, merge_reports
 from checkov.common.output.sarif import Sarif
 from checkov.common.output.spdx import SPDX
@@ -113,6 +120,41 @@ class RunnerRegistry:
             files: Optional[List[str]] = None,
             collect_skip_comments: bool = True,
             repo_root_for_plan_enrichment: list[str | Path] | None = None,
+            progress_tracker: ProgressTracker | None = None,
+            cancellation_token: CancellationToken | None = None,
+    ) -> list[Report]:
+        if progress_tracker is None and cancellation_token is None:
+            # legacy path: identical behavior to before observability existed
+            return self._run_impl(root_folder, external_checks_dir, files, collect_skip_comments,
+                                  repo_root_for_plan_enrichment)
+
+        source = root_folder or "<files>"
+        token = cancellation_token or CancellationToken()
+        self.logger.info("Starting scan run for %s", sanitize_text(str(source)))
+        try:
+            token.throw_if_cancelled({"source": str(source)})
+            reports = self._run_impl(root_folder, external_checks_dir, files, collect_skip_comments,
+                                     repo_root_for_plan_enrichment,
+                                     progress_tracker=progress_tracker, cancellation_token=token)
+        except ScanCancelledError:
+            self.logger.info("Scan run for %s was cancelled", sanitize_text(str(source)))
+            raise
+        except Exception as exc:
+            scan_error = ScanError.from_exception(exc, context={"source": str(source)})
+            self.logger.error("Scan run for %s failed: %s", sanitize_text(str(source)), scan_error)
+            raise scan_error from exc
+        self.logger.info("Completed scan run for %s", sanitize_text(str(source)))
+        return reports
+
+    def _run_impl(
+            self,
+            root_folder: Optional[str] = None,
+            external_checks_dir: Optional[List[str]] = None,
+            files: Optional[List[str]] = None,
+            collect_skip_comments: bool = True,
+            repo_root_for_plan_enrichment: list[str | Path] | None = None,
+            progress_tracker: ProgressTracker | None = None,
+            cancellation_token: CancellationToken | None = None,
     ) -> list[Report]:
         if not self.runners:
             logging.error('There are no runners to run. This can happen if you specify a file type and a framework that are not compatible '
@@ -122,10 +164,14 @@ class RunnerRegistry:
         elif len(self.runners) == 1:
             runner_check_type = self.runners[0].check_type
             if self.licensing_integration.is_runner_valid(runner_check_type):
+                if cancellation_token is not None:
+                    cancellation_token.throw_if_cancelled({"source": str(root_folder or "<files>")})
                 reports: Iterable[Report | list[Report]] = [
                     self.runners[0].run(root_folder, external_checks_dir=external_checks_dir, files=files,
                                         runner_filter=self.runner_filter,
                                         collect_skip_comments=collect_skip_comments)]
+                if progress_tracker is not None:
+                    progress_tracker.update(root_folder or "<files>", 1, 1, runner_check_type, force=True)
             else:
                 # This is the only runner, so raise a clear indication of failure
                 raise ModuleNotEnabledError(f'The framework "{runner_check_type}" is part of the "{self.licensing_integration.get_subscription_for_runner(runner_check_type).name}" module, which is not enabled in the platform',
@@ -165,6 +211,8 @@ class RunnerRegistry:
 
             valid_runners = self._merge_runners(valid_runners)
 
+            total_runners = len(valid_runners)
+            completed_runners = 0
             parallel_runner_results = parallel_runner.run_function(
                 func=_parallel_run,
                 items=valid_runners,
@@ -178,6 +226,12 @@ class RunnerRegistry:
                 if result is not None:
                     report, check_type, graphs, resource_subgraph_map, subprocess_log_stream = result
                     reports.append(report)
+                    completed_runners += 1
+                    if progress_tracker is not None:
+                        progress_tracker.update(root_folder or "<files>", completed_runners, total_runners,
+                                                check_type or "")
+                    if cancellation_token is not None:
+                        cancellation_token.throw_if_cancelled({"source": str(root_folder or "<files>")})
                     if subprocess_log_stream is not None:
                         # only sub processes need to add their logs streams,
                         # the logs of all others methods already exists in the main stream
