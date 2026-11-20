@@ -1,0 +1,51 @@
+# Framework label -> canonical label mapping for the shared resource graph.
+#
+# Adding a new framework must not require code changes: ship a file with the
+# same shape and point SharedGraphConfig.mapping_file at it, or call
+# LabelMapping.register_framework() programmatically.
+#
+# Each entry maps a framework-specific resource label to the canonical
+# (framework-neutral) label stored on GraphNode.canonical_type. The reverse
+# direction is derived automatically so framework reports can restore their
+# original vocabulary.
+version: 1
+frameworks:
+  cloudformation:
+    AWS::S3::Bucket: storage.bucket
+    AWS::IAM::Role: iam.role
+    AWS::IAM::Policy: iam.policy
+    AWS::EC2::SecurityGroup: network.security_group
+    AWS::EC2::Instance: compute.instance
+    AWS::Lambda::Function: compute.function
+    AWS::SQS::Queue: messaging.queue
+    AWS::SNS::Topic: messaging.topic
+  kubernetes:
+    Bucket: storage.bucket
+    Role: iam.role
+    Policy: iam.policy
+    SecurityGroup: network.security_group
+    Pod: compute.instance
+    Deployment: compute.function
+    Queue: messaging.queue
+    Topic: messaging.topic
+  generic_yaml:
+    bucket: storage.bucket
+    role: iam.role
+    policy: iam.policy
+    security_group: network.security_group
+    instance: compute.instance
+    function: compute.function
+    queue: messaging.queue
+    topic: messaging.topic
+# Patterns used to decode cross-file references while building the graph.
+# ``file`` is a regex with one group for the referenced path and ``name`` is
+# an optional regex with one group for the referenced resource id. Patterns
+# are framework-scoped so adding a framework never weakens another framework.
+reference_patterns:
+  cloudformation:
+    - file: '!\w+\s*\[?\s*["'']?([^"'')\s\]#]+)(?:#([^"'')\s\]]+))?'
+  kubernetes:
+    - file: 'ref://([^#\s]+)(?:#(.+))?'
+  generic_yaml:
+    - file: '\$ref:\s*["'']?([^#"'']+)(?:#(.+))?'
+    - file: 'ref://([^#\s]+)(?:#(.+))?'
